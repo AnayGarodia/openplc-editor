@@ -13,9 +13,9 @@
  * data }` envelope conventions as the library catalog client.
  */
 
+import { createHash, createHmac } from 'node:crypto'
 import https from 'https'
 
-import { serializeLicenseBlob } from '../../shared/debug/license-blob'
 import { getEdgeApiBaseUrl } from '../library-manager/desktop-catalog-transport'
 
 /** Request payload sent to the edge activation endpoint. */
@@ -33,7 +33,7 @@ export interface DeviceActivationInput {
  *  post-flash routine can degrade to demo mode without a hard failure. */
 export interface DeviceActivationResult {
   licensed: boolean
-  /** License blob bytes (98 B) when `licensed` — ready to write via FC 0x49. */
+  /** License blob bytes (46 B, HMAC) when `licensed` — ready to write via FC 0x49. */
   license?: number[]
   /** Backend-supplied reason (e.g. "no active subscription"). */
   reason?: string
@@ -48,8 +48,8 @@ const REQUEST_TIMEOUT_MS = 30_000
  * Check whether a device is entitled to a license for the given VPP.
  *
  * `process.env.OPLC_LICENSE_MOCK` short-circuits the network:
- *   - `'licensed'` → `{ licensed: true, license: <golden 98-byte blob> }`
- *     (exercises the on-device write path; 98-byte blob).
+ *   - `'licensed'` → `{ licensed: true, license: <46-byte HMAC blob for this device> }`
+ *     (exercises the on-device write + verify path; built with the TEST key).
  *   - `'demo'`     → `{ licensed: false }`.
  *   - absent       → calls the real edge client (§4).
  */
@@ -57,7 +57,7 @@ export async function checkDeviceActivation(input: DeviceActivationInput): Promi
   // TODO(D49/D51): remover o toggle quando o modulo vpp-licenses do autonomy-edge existir.
   const mock = process.env.OPLC_LICENSE_MOCK
   if (mock === 'licensed') {
-    return { licensed: true, license: goldenLicenseBytes() }
+    return { licensed: true, license: hmacLicenseBytes(input) }
   }
   if (mock === 'demo') {
     return { licensed: false }
@@ -153,24 +153,51 @@ function unwrapHttpEnvelope(raw: unknown): unknown {
 }
 
 // ---------------------------------------------------------------------------
-// Mock golden blob
+// Mock HMAC blob (spike)
 // ---------------------------------------------------------------------------
 
+/** 'OPLC' magic bytes. */
+const LIC_MAGIC = [0x4f, 0x50, 0x4c, 0x43]
+/** fmt_version 2 = HMAC layout. */
+const FMT_VERSION_HMAC = 2
 /**
- * The deterministic 98-byte golden license blob, as `number[]`. Built via
- * the shared `serializeLicenseBlob` from the known golden input (the same
- * vector as `on-device-license-storage`'s `license-golden.json`), so the
- * mock exercises a byte-valid on-device write.
+ * Deterministic 32-byte TEST key, identical to the one baked into the esp8266
+ * .a (gen-license-golden.ts / wsl-rebuild-a-hmac.sh derive it the same way).
+ * NOT a production secret — real per-VPP keys come from the backend.
  */
-function goldenLicenseBytes(): number[] {
-  const blob = serializeLicenseBlob({
-    magic: 0, // forced to LIC_MAGIC_LE by the serializer
-    fmtVersion: 1,
-    keyId: 0,
-    deviceId: Uint8Array.from([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]),
-    productId: Uint8Array.from([160, 161, 162, 163, 164, 165, 166, 167]),
-    signature: new Uint8Array(64).fill(17),
-    crc32: 0, // recomputed by the serializer
-  })
+const HMAC_TEST_KEY = createHash('sha256').update(Buffer.from('openplc-license-hmac-test-key-v1', 'ascii')).digest()
+
+function hexToBytes(hex: string): Uint8Array {
+  const out = new Uint8Array(Math.floor(hex.length / 2))
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16)
+  return out
+}
+
+/**
+ * SPIKE mock: build a valid 46-byte HMAC license blob for THIS device, keyed by
+ * the TEST key baked into the .a. It uses the caller's real deviceId/vppId, so
+ * the device's on-boot verify (recompute device_id + HMAC tag) passes -> FULL.
+ * Grants a license to whatever device asks; stands in for the backend issue.
+ *
+ *   payload(30) = magic | fmt=2 | keyId=0 | deviceId[16] | productId[8]
+ *   tag(16)     = HMAC-SHA256(TEST_KEY, payload)[:16]
+ *   blob(46)    = payload || tag
+ */
+function hmacLicenseBytes(input: DeviceActivationInput): number[] {
+  const deviceId = hexToBytes(input.deviceId)
+  const productId = hexToBytes(input.vppId)
+
+  const payload = new Uint8Array(30)
+  payload.set(LIC_MAGIC, 0)
+  payload[4] = FMT_VERSION_HMAC
+  payload[5] = 0 // keyId
+  payload.set(deviceId.subarray(0, 16), 6)
+  payload.set(productId.subarray(0, 8), 22)
+
+  const tag = createHmac('sha256', HMAC_TEST_KEY).update(Buffer.from(payload)).digest().subarray(0, 16)
+
+  const blob = new Uint8Array(46)
+  blob.set(payload, 0)
+  blob.set(tag, 30)
   return Array.from(blob)
 }
